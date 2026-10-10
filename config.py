@@ -89,6 +89,16 @@ class VigilanceConfig:
     evidence_dir: str = "evidence"
     strict: bool = False  # True -> re-raise scenario errors (debug); False -> log + continue
     log_level: str = "INFO"
+    # --- telegram incident alerts (token via VIGILANCE_TELEGRAM_BOT_TOKEN env) ---
+    telegram_enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_cooldown_sec: float = 60.0
+    telegram_notify_fight: bool = True
+    telegram_notify_fall: bool = True
+    telegram_notify_fire: bool = True
+    telegram_notify_bag: bool = True
+    telegram_notify_weapon: bool = True
 
     # ------------------------------------------------------------------
     def to_dict(self) -> dict:
@@ -160,6 +170,11 @@ class VigilanceConfig:
             ("bag_proximity_px", float), ("bag_separation_px", float),
             ("bag_confirm_sec", float), ("evidence_dir", str),
             ("strict", bool), ("log_level", str),
+            ("telegram_enabled", bool), ("telegram_bot_token", str),
+            ("telegram_chat_id", str), ("telegram_cooldown_sec", float),
+            ("telegram_notify_fight", bool), ("telegram_notify_fall", bool),
+            ("telegram_notify_fire", bool), ("telegram_notify_bag", bool),
+            ("telegram_notify_weapon", bool),
             ("fight_pair_max_distance", float), ("fight_min_person_visibility", float),
             ("fight_max_candidate_pairs", int), ("fight_window_seconds", float),
             ("fight_target_fps", int), ("fight_temporal_length", int),

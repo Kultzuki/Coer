@@ -267,6 +267,27 @@ A CPU torchvision beside CUDA torch breaks YOLO NMS on GPU with
 `torchvision::nms ... CUDA backend` — reinstall torchvision from the same
 CUDA index as torch.
 
+## Telegram incident alerts
+
+One message per incident (fight scene, fall, fire/smoke), with the alert
+frame attached as a photo. A cooldown (default 60s) stops flapping scenes
+from spamming a phone. Delivery failures only log — the video pump never
+blocks on the network.
+
+```powershell
+# 1. message your bot once, then get your chat id:
+#    open https://api.telegram.org/bot<TOKEN>/getUpdates  -> "chat":{"id":...}
+# 2. run with alerts on (token via env var, never committed):
+$env:VIGILANCE_TELEGRAM_BOT_TOKEN = "<token>"
+.venv/Scripts/python.exe ui.py --source 0 --telegram --telegram-chat-id <id>
+```
+
+Flags: `--telegram` (enable), `--telegram-chat-id`, `--telegram-cooldown`
+(seconds), `--telegram-bot-token` (env var preferred). Config equivalents:
+`telegram_enabled`, `telegram_chat_id`, `telegram_cooldown_sec`,
+`telegram_notify_fight/fall/fire`. Keep the token out of git — it is
+accepted from env/flag only in practice and never logged.
+
 ## What changed vs legacy (foundational only)
 
 1. Broken pose default fixed; all model paths configurable.

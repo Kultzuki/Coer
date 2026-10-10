@@ -119,6 +119,25 @@ def _model_status(pipeline: Pipeline) -> dict:
     }
 
 
+def _alert_details(result_alerts, threat_alerts) -> dict:
+    """Name -> {confidence, message} for every live alert (sidebar data)."""
+    details = {}
+    for source in (result_alerts or {}, threat_alerts or {}):
+        for name, data in source.items():
+            if not isinstance(data, dict):
+                continue
+            try:
+                conf = data.get("confidence")
+                conf = None if conf is None else round(float(conf), 3)
+            except (TypeError, ValueError):
+                conf = None
+            details[str(name)] = {
+                "confidence": conf,
+                "message": str(data.get("message", "")),
+            }
+    return details
+
+
 def _status_from_result(pipeline: Pipeline, result, fps: float, source: str,
                         threat_frame=None) -> dict:
     persons = [
@@ -165,6 +184,7 @@ def _status_from_result(pipeline: Pipeline, result, fps: float, source: str,
         "scene": scene,
         "model": _model_status(pipeline),
         "alerts": sorted(set(result.alerts) | set(threat_alerts)),
+        "alert_details": _alert_details(result.alerts, threat_alerts),
         "threats": threat_detections,
         "threat_models": threat_frame.get("models", {}),
         "diagnostics": result.diagnostics,
@@ -185,8 +205,52 @@ def _draw_model_banner(frame, pipeline: Pipeline) -> None:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
 
 
+def open_capture(source):
+    """Open a video source, trying alternate Windows backends for webcams.
+
+    Returns (cap, backend_label) on success, else (None, error_text).
+    A successful open is verified with a real frame grab: some laptop
+    cameras report "opened" yet deliver nothing usable under the default
+    backend, which previously surfaced as garbage frames downstream.
+    """
+    is_cam = str(source).isdigit()
+    src: object = int(source) if is_cam else source
+    backends = [None]
+    if is_cam:
+        backends += [cv2.CAP_DSHOW, cv2.CAP_MSMF]
+    tried = []
+    for backend in backends:
+        label = "default" if backend is None else str(backend)
+        tried.append(label)
+        try:
+            cap = cv2.VideoCapture(src) if backend is None else cv2.VideoCapture(src, backend)
+        except Exception as exc:
+            log.warning("event=ui_capture_open_failed backend=%s error=%r", label, exc)
+            continue
+        if not cap.isOpened():
+            cap.release()
+            continue
+        ok, frame = cap.read()
+        if not ok or frame is None or min(frame.shape[:2]) <= 0:
+            cap.release()
+            log.warning("event=ui_capture_no_frames backend=%s source=%r", label, source)
+            continue
+        if not is_cam:
+            # The probe grab consumed frame 0; reopen so playback starts
+            # at the beginning instead of silently dropping the first frame.
+            cap.release()
+            cap = cv2.VideoCapture(src)
+            if not cap.isOpened():
+                continue
+        log.info("event=ui_capture_open source=%r backend=%s size=%sx%s",
+                 source, label, frame.shape[1], frame.shape[0])
+        return cap, label
+    return None, f"cannot open source {source!r} (tried backends: {', '.join(tried)}; " \
+                 "close other apps using the camera and retry)"
+
+
 def pump_frames(state: LiveState, pipeline: Pipeline, source, fps_fallback: float,
-                synthetic_frames=None, threat_detector=None) -> None:
+                synthetic_frames=None, threat_detector=None, notifier=None) -> None:
     from core.visualization import (draw_alerts, draw_pairs, draw_scene_panel,
                                     draw_threats, draw_tracks)
 
@@ -214,18 +278,13 @@ def pump_frames(state: LiveState, pipeline: Pipeline, source, fps_fallback: floa
                     plays, ended = 0, False
 
                 if cap is None and not ended:
-                    src: object = (int(current_source)
-                                   if str(current_source).isdigit()
-                                   else current_source)
-                    cap = cv2.VideoCapture(src)
-                    if not cap.isOpened():
-                        cap.release()
-                        cap = None
+                    cap, open_error = open_capture(current_source)
+                    if cap is None:
                         with state.lock:
                             state.status = {
                                 "running": False,
                                 "source": current_source,
-                                "error": f"cannot open source {current_source!r}",
+                                "error": open_error,
                             }
                         time.sleep(0.1)
                         continue
@@ -303,6 +362,10 @@ def pump_frames(state: LiveState, pipeline: Pipeline, source, fps_fallback: floa
             if not ok:
                 idx += 1
                 continue
+            if notifier is not None:
+                from core.alert_dispatch import incident_from_state
+                notifier.maybe_notify(
+                    incident_from_state(scene_name, alerts, ts), bytes(buf))
             now = time.perf_counter()
             ema = (now - last) if ema is None else 0.9 * ema + 0.1 * (now - last)
             last = now
@@ -332,531 +395,1371 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VIGLANCE - Camera Watch</title>
+<title>RakshaNetra — VIGLANCE AI Surveillance System</title>
 <style>
-:root{
-  --bg:#080b11;
-  --surface:#111823;
-  --surface-2:#0c111a;
-  --line:#223047;
-  --text:#eaf0f8;
-  --muted:#a3b1c6;
-  --calm:#5fd08a;
-  --warning:#f6b93f;
-  --danger:#ff8177;
-  --neutral:#a3b1c6;
-  --radius:16px;
+:root {
+  --bg-dark: #0a0f1d;
+  --bg-sidebar: #090e1a;
+  --bg-panel: #111828;
+  --bg-card: #131c2e;
+  --border-color: #1e293f;
+  --border-subtle: #172133;
+  --text-main: #f1f5f9;
+  --text-muted: #7d8ea5;
+  --text-sub: #94a3b8;
+  --accent-cyan: #38bdf8;
+  --accent-cyan-glow: rgba(56, 189, 248, 0.25);
+  --accent-blue: #0284c7;
+  --alert-red: #ef4444;
+  --alert-red-dark: #991b1b;
+  --alert-red-bg: rgba(239, 68, 68, 0.16);
+  --alert-red-pill: rgba(220, 38, 38, 0.45);
+  --status-green: #10b981;
 }
-*{box-sizing:border-box}
-html,body{margin:0;padding:0}
-body{
-  background:var(--bg);
-  color:var(--text);
-  font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-  font-size:15px;
-  line-height:1.5;
-  overflow-x:hidden;
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg-dark);
+  color: var(--text-main);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  height: 100vh;
+  display: flex;
+  overflow: hidden;
+  font-size: 13px;
 }
-.masthead{
-  display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;
-  padding:18px 26px;border-bottom:1px solid var(--line);background:var(--surface-2);
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #334155; }
+
+/* LEFT SIDEBAR */
+#sidebar {
+  width: 220px;
+  min-width: 220px;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  padding: 16px 14px;
+  user-select: none;
 }
-.brand{font-size:19px;font-weight:800;letter-spacing:.16em;text-transform:uppercase}
-.brand span{color:var(--muted);font-weight:600;letter-spacing:.03em;text-transform:none;font-size:14px;margin-left:10px}
-.srcpill{
-  font-size:11px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
-  color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:7px 15px;
-  overflow-wrap:anywhere;max-width:100%;
+.brand-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 18px;
 }
-.layout{
-  display:grid;grid-template-columns:minmax(0,1.6fr) minmax(320px,1fr);
-  gap:20px;align-items:stretch;max-width:1580px;margin:0 auto;padding:22px 26px;
+.brand-logo-icon {
+  width: 46px;
+  height: 46px;
+  margin-bottom: 8px;
+  filter: drop-shadow(0 0 10px rgba(56, 189, 248, 0.4));
 }
-@media (max-width:1080px){.layout{grid-template-columns:minmax(0,1fr)}}
-.stage{min-width:0}
-.console{min-width:0;display:flex;flex-direction:column}
-.console .activitycard{flex:1 1 auto;display:flex;flex-direction:column;min-height:200px}
-.card{
-  background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);
-  padding:22px 24px;margin-bottom:20px;
+.brand-title {
+  font-size: 19px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: #fff;
+  line-height: 1.1;
 }
-.label{
-  font-size:11px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;
-  color:var(--muted);margin:0 0 14px;
+.brand-title span { color: var(--accent-cyan); }
+.brand-subtitle {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
 }
-.hero{
-  position:relative;display:flex;align-items:center;gap:20px;overflow:hidden;
-  border:1px solid var(--line);border-left:8px solid var(--accent);
-  border-radius:var(--radius);padding:26px 28px;margin-bottom:20px;
-  background-color:var(--surface);
-  background-image:linear-gradient(100deg,var(--tint) 0%,transparent 58%);
+
+.nav-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
 }
-.hero[data-severity="calm"]{--accent:var(--calm);--tint:rgba(95,208,138,.13)}
-.hero[data-severity="warning"]{--accent:var(--warning);--tint:rgba(246,185,63,.13)}
-.hero[data-severity="danger"]{--accent:var(--danger);--tint:rgba(255,129,119,.15)}
-.hero[data-severity="neutral"]{--accent:var(--neutral);--tint:rgba(163,177,198,.10)}
-#heroIcon{flex:none;display:block}
-#heroIcon .ico{width:58px;height:58px;color:var(--accent)}
-.herotext{min-width:0}
-.statechip{
-  display:inline-block;font-size:10px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;
-  color:var(--accent);border:1px solid currentColor;border-radius:999px;
-  padding:4px 11px;margin-bottom:12px;
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  color: var(--text-muted);
+  text-decoration: none;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border: 1px solid transparent;
 }
-#heroTitle{
-  margin:0;font-weight:800;letter-spacing:-.02em;line-height:1.06;
-  font-size:clamp(26px,3.6vw,46px);overflow-wrap:anywhere;
+.nav-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-main);
 }
-#heroDetail{margin:10px 0 0;font-size:clamp(14px,1.3vw,17px);color:var(--muted);overflow-wrap:anywhere}
-.chips{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 16px}
-.chip{
-  font-size:13px;font-weight:700;border-radius:999px;padding:7px 15px;
-  border:1px solid currentColor;color:var(--danger);
+.nav-item.active {
+  background: rgba(14, 165, 233, 0.14);
+  color: var(--accent-cyan);
+  border-color: rgba(56, 189, 248, 0.3);
+  box-shadow: 0 0 15px rgba(56, 189, 248, 0.1);
 }
-img#stream{
-  display:block;width:100%;max-width:100%;aspect-ratio:16/9;object-fit:contain;
-  background:#000;border:1px solid var(--line);border-radius:12px;
+.nav-item svg {
+  width: 17px;
+  height: 17px;
+  flex-shrink: 0;
+  stroke: currentColor;
 }
-#stage[data-off="1"] img#stream{opacity:.22;filter:grayscale(1) brightness(.75) contrast(.8)}
-.playerbar{display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap;margin:14px 0 0}
-.badge{
-  flex:none;font-size:10px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;
-  border:1px solid currentColor;border-radius:999px;padding:5px 12px;
-  color:var(--calm);background:rgba(95,208,138,.12);
+
+/* MAIN LAYOUT WRAPPER */
+#main-wrapper {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-width: 0;
+  overflow: hidden;
 }
-#stage[data-off="1"] .badge{color:var(--danger);background:rgba(255,129,119,.14)}
-.videonote{margin:0;flex:1 1 220px;min-width:0;font-size:13px;color:var(--muted)}
-.tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
-.tile{background:var(--surface-2);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
-.tile .n{font-size:30px;font-weight:800;line-height:1.1;letter-spacing:-.02em;overflow-wrap:anywhere}
-.tile .n.small{font-size:18px;line-height:1.3;letter-spacing:0;word-break:normal;overflow-wrap:break-word}
-.tile .k{font-size:10px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-top:9px}
-.tile .s{font-size:13px;color:var(--muted);margin-top:6px;overflow-wrap:anywhere}
-.activity{list-style:none;margin:0;padding:0;flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain}
-.activity li{display:flex;align-items:center;gap:12px;padding:13px 0;border-bottom:1px solid var(--line)}
-.activity li:last-child{border-bottom:0;padding-bottom:0}
-.activity .tag{
-  flex:none;font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
-  border:1px solid currentColor;border-radius:999px;padding:4px 10px;
+
+/* TOP STATUS BAR */
+#topbar {
+  height: 52px;
+  background: #0d1424;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+  flex-shrink: 0;
 }
-.activity .grow{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
-.activity .time{flex:none;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
-li.sev-danger .tag{color:var(--danger)}
-li.sev-warning .tag{color:var(--warning)}
-li.sev-calm .tag{color:var(--calm)}
-li.sev-neutral .tag{color:var(--neutral)}
-.actions{display:grid;gap:12px}
-.actions form{display:grid;gap:12px}
-button{
-  width:100%;min-height:62px;padding:18px 20px;border:0;border-radius:14px;
-  font-family:inherit;font-size:16px;font-weight:800;color:#04120b;
-  background:var(--calm);cursor:pointer;transition:filter .18s ease,transform .18s ease;
+.top-metrics {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  font-size: 13px;
+  font-weight: 600;
 }
-button:hover{filter:brightness(1.08)}
-button:active{transform:translateY(1px)}
-button.ghost{background:var(--surface-2);color:var(--text);border:1px solid var(--line)}
-button:focus-visible,summary:focus-visible{outline:3px solid var(--warning);outline-offset:3px}
-input[type=file]{
-  width:100%;font-family:inherit;font-size:14px;color:var(--muted);
-  background:var(--surface-2);border:1px dashed var(--line);border-radius:14px;padding:14px;
+.metric-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #cbd5e1;
 }
-input[type=file]::file-selector-button{
-  font-family:inherit;font-weight:700;color:var(--text);background:var(--surface);
-  border:1px solid var(--line);border-radius:10px;padding:9px 14px;margin-right:12px;cursor:pointer;
+.metric-divider {
+  width: 1px;
+  height: 16px;
+  background: var(--border-color);
 }
-#sourceMessage{margin:14px 0 0;font-size:14px;color:var(--muted);min-height:1.5em;overflow-wrap:anywhere}
-details.tech{max-width:1580px;margin:0 auto;padding:0 26px 48px}
-details.tech>summary{
-  cursor:pointer;list-style:none;display:flex;align-items:center;gap:12px;
-  padding:18px 24px;border:1px solid var(--line);border-radius:var(--radius);
-  background:var(--surface);color:var(--muted);
-  font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;
+.status-indicator {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  background: var(--status-green);
+  border-radius: 50%;
+  box-shadow: 0 0 8px var(--status-green);
 }
-details.tech>summary::-webkit-details-marker{display:none}
-.chev{
-  width:9px;height:9px;flex:none;border-right:2px solid currentColor;border-bottom:2px solid currentColor;
-  transform:rotate(-45deg);transition:transform .18s ease;
+.alert-pill-badge {
+  background: var(--alert-red);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  padding: 1px 7px;
+  border-radius: 10px;
+  min-width: 18px;
+  text-align: center;
 }
-details.tech[open]>summary{border-bottom-left-radius:0;border-bottom-right-radius:0;color:var(--text)}
-details.tech[open]>summary .chev{transform:rotate(45deg)}
-.techbody{
-  border:1px solid var(--line);border-top:0;
-  border-bottom-left-radius:var(--radius);border-bottom-right-radius:var(--radius);
-  background:var(--surface-2);padding:22px 24px;
+.top-user {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
 }
-.tgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:22px}
-.tcell{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
-.pre{
-  margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#c3d0e2;
-  white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;
+.user-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #1e293b;
+  border: 1px solid #38bdf8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
-.scroll-x{overflow-x:auto}
-table{border-collapse:collapse;width:100%;font-size:13px}
-td,th{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;white-space:nowrap}
-th{font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
-.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
-.empty{margin:10px 0 0;font-size:13px;color:var(--muted)}
-.toast{
-  position:fixed;right:20px;bottom:20px;z-index:9;max-width:min(92vw,420px);
-  background:var(--danger);color:#1b0a09;padding:15px 20px;border-radius:12px;
-  box-shadow:0 18px 40px rgba(0,0,0,.5);font-weight:800;overflow-wrap:anywhere;
+.user-name {
+  font-weight: 600;
+  color: #e2e8f0;
 }
-@media (max-width:560px){
-  .masthead{padding:14px 16px}
-  .layout{padding:16px}
-  .hero{padding:20px 18px;gap:14px;border-left-width:6px}
-  #heroIcon .ico{width:40px;height:40px}
-  .card{padding:18px 16px}
-  .tiles{grid-template-columns:minmax(0,1fr)}
-  details.tech{padding:0 16px 36px}
-  .techbody{padding:16px}
-  .toast{right:12px;left:12px;bottom:12px;max-width:none}
+
+/* CONTENT CONTAINER */
+#content-area {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
 }
-@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* CENTER DASHBOARD AREA */
+#center-viewport {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 16px;
+  gap: 12px;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+/* CAMERA 2x2 GRID */
+.camera-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 12px;
+  flex: 1;
+  min-height: 480px;
+}
+.camera-card {
+  background: #080d17;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  transition: border-color 0.2s;
+}
+.camera-card:hover {
+  border-color: #2e4162;
+}
+.camera-card.highlight {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 15px rgba(56, 189, 248, 0.25);
+}
+.camera-header {
+  height: 28px;
+  background: rgba(13, 20, 36, 0.95);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #cbd5e1;
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+.camera-header-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.camera-time {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 11px;
+}
+
+.camera-feed-box {
+  flex: 1;
+  position: relative;
+  background: #000;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.camera-feed-box img#liveStream {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* Overlay alert tags inside camera views */
+.camera-overlay-alerts {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+  z-index: 5;
+  pointer-events: none;
+}
+.cam-alert-tag {
+  background: rgba(185, 28, 28, 0.85);
+  border: 1px solid rgba(239, 68, 68, 0.9);
+  color: #fee2e2;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  backdrop-filter: blur(4px);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+.cam-alert-tag svg {
+  width: 12px;
+  height: 12px;
+  fill: currentColor;
+}
+
+/* Camera Standby Placeholder View */
+.cam-placeholder {
+  width: 100%;
+  height: 100%;
+  background: radial-gradient(circle at center, #0c1629 0%, #060a13 100%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  border: 1px dashed rgba(56, 189, 248, 0.15);
+}
+.cctv-grid-overlay {
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(rgba(56, 189, 248, 0.03) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(56, 189, 248, 0.03) 1px, transparent 1px);
+  background-size: 24px 24px;
+  pointer-events: none;
+}
+.cctv-reticle {
+  position: absolute;
+  inset: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  pointer-events: none;
+}
+.cctv-reticle::before, .cctv-reticle::after {
+  content: "";
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border-color: rgba(56, 189, 248, 0.3);
+  border-style: solid;
+}
+.cctv-reticle::before { top: -1px; left: -1px; border-width: 2px 0 0 2px; }
+.cctv-reticle::after { bottom: -1px; right: -1px; border-width: 0 2px 2px 0; }
+
+.cam-slot-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: rgba(14, 165, 233, 0.1);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  color: var(--accent-cyan);
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  z-index: 2;
+  transition: all 0.15s;
+}
+.cam-slot-btn:hover {
+  background: rgba(14, 165, 233, 0.25);
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.2);
+}
+.cam-fullscreen-btn {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  background: rgba(13, 20, 36, 0.8);
+  border: 1px solid var(--border-color);
+  color: var(--text-muted);
+  border-radius: 6px;
+  padding: 6px;
+  cursor: pointer;
+}
+.cam-fullscreen-btn:hover {
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+}
+.cam-slot-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 6px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* BOTTOM ANALYTICS ROW */
+.bottom-analytics-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  height: 130px;
+  min-height: 130px;
+}
+.analytics-card {
+  background: #0d1424;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+}
+.card-header-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.card-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #f1f5f9;
+}
+.card-more-btn {
+  color: var(--text-muted);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+
+/* Heatmap Grid */
+.heatmap-container {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(18, 1fr);
+  grid-template-rows: repeat(4, 1fr);
+  gap: 3px;
+  align-items: center;
+}
+.heatmap-cell {
+  border-radius: 2px;
+  width: 100%;
+  height: 100%;
+  min-height: 12px;
+  transition: transform 0.1s;
+}
+.heatmap-cell:hover {
+  transform: scale(1.15);
+  z-index: 2;
+}
+
+/* SVG Line Chart */
+.chart-container {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+.chart-container svg {
+  width: 100%;
+  height: 100%;
+}
+
+/* RIGHT SIDEBAR - ACTIVE ALERTS */
+#alerts-sidebar {
+  width: 320px;
+  min-width: 320px;
+  background: var(--bg-sidebar);
+  border-left: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  padding: 16px 14px;
+  overflow-y: auto;
+  gap: 12px;
+}
+.alerts-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.alerts-header-title {
+  font-size: 15px;
+  font-weight: 800;
+  color: #fff;
+}
+.alerts-clock {
+  font-size: 12px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.alerts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+}
+
+/* Alert Item Card */
+.alert-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-left: 4px solid var(--alert-red);
+  border-radius: 6px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: transform 0.15s, border-color 0.15s;
+}
+.alert-card:hover {
+  border-color: #334460;
+  border-left-color: var(--alert-red);
+}
+.alert-top {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.alert-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: #f8fafc;
+}
+.alert-cam {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.alert-confidence {
+  font-size: 12px;
+  color: #e2e8f0;
+  font-weight: 600;
+}
+.alert-confidence span {
+  color: var(--accent-cyan);
+}
+.alert-reasoning {
+  font-size: 11.5px;
+  color: var(--text-sub);
+  line-height: 1.35;
+}
+.alert-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+.btn-view-live {
+  flex: 1;
+  background: #0ea5e9;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn-view-live:hover {
+  background: #38bdf8;
+}
+.btn-dismiss {
+  flex: 1;
+  background: transparent;
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.btn-dismiss:hover {
+  background: rgba(239, 68, 68, 0.15);
+  border-color: var(--alert-red);
+}
+
+/* SOURCE CONFIG MODAL */
+#sourceModal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(4px);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+}
+.modal-content {
+  background: #0f172a;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  width: 440px;
+  max-width: 90vw;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.modal-header h3 {
+  font-size: 16px;
+  color: #fff;
+  font-weight: 700;
+}
+.modal-close-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 20px;
+  cursor: pointer;
+}
+.modal-tabs {
+  display: flex;
+  gap: 8px;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 8px;
+}
+.modal-tab {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  padding: 6px 12px;
+  font-weight: 600;
+  font-size: 12.5px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.modal-tab.active {
+  background: rgba(56, 189, 248, 0.15);
+  color: var(--accent-cyan);
+}
+.modal-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.modal-input {
+  width: 100%;
+  background: #090e1a;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px 12px;
+  color: #fff;
+  font-size: 13px;
+}
+.modal-submit-btn {
+  background: var(--accent-cyan);
+  color: #041426;
+  border: none;
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-weight: 800;
+  cursor: pointer;
+  font-size: 13px;
+  transition: opacity 0.15s;
+}
+.modal-submit-btn:hover { opacity: 0.9; }
+#modalMessage {
+  font-size: 12px;
+  color: var(--accent-cyan);
+  min-height: 18px;
+}
+
+/* TECH DRAWER */
+#techDrawer {
+  display: none;
+  position: fixed;
+  right: 0;
+  top: 52px;
+  bottom: 0;
+  width: 420px;
+  background: #090e1a;
+  border-left: 1px solid var(--border-color);
+  z-index: 90;
+  padding: 18px 20px;
+  overflow-y: auto;
+  flex-direction: column;
+  gap: 14px;
+  box-shadow: -10px 0 30px rgba(0, 0, 0, 0.5);
+}
+#techDrawer.open { display: flex; }
+.drawer-title { font-size: 14px; font-weight: 700; color: #fff; display: flex; justify-content: space-between; }
+.code-box {
+  background: #060a12;
+  border: 1px solid #1a2538;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  color: #93c5fd;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 </style>
 </head>
 <body>
-<header class="masthead">
-  <div class="brand">Viglance<span>Camera watch</span></div>
-  <div class="srcpill" id="srcPill">Starting up</div>
-</header>
 
-<main class="layout">
-  <section class="stage" id="stage" data-off="0">
-    <div class="hero" id="hero" data-severity="neutral" aria-live="polite">
-      <span id="heroIcon" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg></span>
-      <div class="herotext">
-        <span class="statechip" id="heroState">Status: live</span>
-        <h1 id="heroTitle">Watching</h1>
-        <p id="heroDetail">Analysing the video…</p>
-      </div>
-    </div>
-    <div class="card">
-      <div class="chips" id="threatChips"></div>
-      <img id="stream" src="/stream.mjpg" alt="Live camera view">
-      <div class="playerbar">
-        <span class="badge" id="liveBadge">Live feed</span>
-        <p class="videonote" id="videoNote">Live view from the camera. Every frame is processed on this computer.</p>
-      </div>
-    </div>
-  </section>
-
-  <section class="console">
-    <div class="card">
-      <h2 class="label">At a glance</h2>
-      <div class="tiles">
-        <div class="tile">
-          <div class="n" id="statPeople">0</div>
-          <div class="k">People in view</div>
-          <div class="s" id="statPeopleSub">No one in view</div>
-        </div>
-        <div class="tile">
-          <div class="n" id="statAlerts">0</div>
-          <div class="k">Alerts right now</div>
-          <div class="s" id="statAlertsSub">Nothing to worry about</div>
-        </div>
-        <div class="tile">
-          <div class="n" id="statIncidents">0</div>
-          <div class="k">Recent incidents</div>
-          <div class="s" id="statIncidentsSub">Nothing recorded yet</div>
-        </div>
-        <div class="tile">
-<div class="n small" id="statSource">Starting up</div>
-<div class="k" id="statSourceLabel">Watching</div>
-          <div class="s" id="statSourceSub">Connecting to the camera</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="card activitycard">
-      <h2 class="label">Recent activity</h2>
-      <ul class="activity" id="activity">
-        <li class="sev-neutral"><span class="tag">Live</span><span class="grow">Nothing to report yet. Activity will appear here.</span></li>
-      </ul>
-    </div>
-
-    <div class="card">
-      <h2 class="label">What you can do</h2>
-      <div class="actions">
-        <button id="webcam" type="button">Use the computer camera</button>
-        <form id="uploadForm">
-          <input id="videoFile" type="file" accept="video/*,.avi,.mkv,.mov,.mp4,.mpeg,.mpg,.webm,.wmv" required>
-          <button type="submit">Play a video file</button>
-        </form>
-        <button id="notifications" type="button" class="ghost">Turn on fight alerts on this device</button>
-      </div>
-      <p id="sourceMessage" role="status"></p>
-    </div>
-  </section>
-</main>
-
-<details class="tech">
-  <summary><span class="chev" aria-hidden="true"></span>Technical details (for engineers)</summary>
-  <div class="techbody">
-    <pre class="pre" id="meta">frame - t=- fps=- src=-</pre>
-    <div class="tgrid">
-      <div class="tcell">
-        <h3 class="label">Model state</h3>
-        <pre class="pre" id="model">ready=- head_trained=- ckpt=none</pre>
-      </div>
-      <div class="tcell">
-        <h3 class="label">Threat models</h3>
-        <pre class="pre" id="threatModels">{}</pre>
-      </div>
-      <div class="tcell">
-        <h3 class="label">People</h3>
-        <div class="scroll-x" id="people"></div>
-      </div>
-      <div class="tcell">
-        <h3 class="label">Pairs</h3>
-        <div class="scroll-x" id="pairs"></div>
-      </div>
-      <div class="tcell">
-        <h3 class="label">Threat detections</h3>
-        <div class="scroll-x" id="threats"></div>
-      </div>
-      <div class="tcell">
-        <h3 class="label">Diagnostics</h3>
-        <pre class="pre" id="diag">{}</pre>
-      </div>
-    </div>
+<!-- LEFT NAVIGATION SIDEBAR -->
+<aside id="sidebar">
+  <div class="brand-box">
+    <!-- RakshaNetra Eye-Shield Logo -->
+    <svg class="brand-logo-icon" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M50 8L86 24V50C86 73 70.8 90 50 96C29.2 90 14 73 14 50V24L50 8Z" stroke="#38bdf8" stroke-width="4.5" fill="rgba(14, 165, 233, 0.12)"/>
+      <ellipse cx="50" cy="50" rx="26" ry="17" stroke="#38bdf8" stroke-width="3.5" fill="none"/>
+      <circle cx="50" cy="50" r="10" fill="#38bdf8"/>
+      <circle cx="52" cy="48" r="3.5" fill="#ffffff"/>
+    </svg>
+    <div class="brand-title">Raksha<span>Netra</span></div>
+    <div class="brand-subtitle">AI - सहायक सुरक्षा सिस्टम</div>
   </div>
-</details>
 
-<div id="notification" class="toast" role="status" hidden></div>
+  <nav class="nav-menu">
+    <div class="nav-item active" id="navDashboard">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="7" height="7"></rect>
+        <rect x="14" y="3" width="7" height="7"></rect>
+        <rect x="14" y="14" width="7" height="7"></rect>
+        <rect x="3" y="14" width="7" height="7"></rect>
+      </svg>
+      Dashboard
+    </div>
+    <div class="nav-item" id="navLive" onclick="openSourceModal('CAM-01')">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="23 7 16 12 23 17 23 7"></polygon>
+        <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+      </svg>
+      Live Monitoring
+    </div>
+    <div class="nav-item" onclick="toggleTechDrawer()">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"></circle>
+        <polyline points="12 6 12 12 16 14"></polyline>
+      </svg>
+      Incident History
+    </div>
+    <div class="nav-item" onclick="toggleTechDrawer()">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="18" y1="20" x2="18" y2="10"></line>
+        <line x1="12" y1="20" x2="12" y2="4"></line>
+        <line x1="6" y1="20" x2="6" y2="14"></line>
+      </svg>
+      Analytics
+    </div>
+    <div class="nav-item" onclick="toggleTechDrawer()">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+      </svg>
+      Camera Health
+    </div>
+    <div class="nav-item" onclick="toggleTechDrawer()">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+      </svg>
+      Settings
+    </div>
+  </nav>
+</aside>
+
+<!-- MAIN APP AREA -->
+<div id="main-wrapper">
+  <!-- TOP STATUS BAR -->
+  <header id="topbar">
+    <div class="top-metrics">
+      <div class="metric-item">
+        <span class="status-indicator"></span>
+        <span>System Active</span>
+      </div>
+      <div class="metric-divider"></div>
+      <div class="metric-item">
+        <span>Total Cameras Online: <strong id="camCount">—</strong></span>
+      </div>
+      <div class="metric-divider"></div>
+      <div class="metric-item">
+        <span>Active Alerts:</span>
+        <span class="alert-pill-badge" id="topAlertCount">0</span>
+      </div>
+      <div class="metric-divider"></div>
+      <div class="metric-item">
+        <span>Latency: <strong id="latencyVal">—</strong></span>
+      </div>
+    </div>
+
+    <div class="top-user" onclick="toggleTechDrawer()" title="Click to view system diagnostics">
+      <div class="user-avatar">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+          <circle cx="12" cy="7" r="4"></circle>
+        </svg>
+      </div>
+      <span class="user-name">Admin</span>
+      <span style="font-size:10px; color:#64748b;">&#9662;</span>
+    </div>
+  </header>
+
+  <!-- CONTENT -->
+  <div id="content-area">
+    <!-- CENTER VIEWPORT -->
+    <main id="center-viewport">
+      <!-- 2x2 CAMERA GRID -->
+      <div class="camera-grid">
+        <!-- CAM-01 (ACTIVE LIVE FEED) -->
+        <div class="camera-card highlight" id="cardCam1">
+          <div class="camera-header">
+            <div class="camera-header-left">
+              <span>CAM-01 Main Gate - <span class="live-clock">10:45 AM</span></span>
+            </div>
+            <span class="camera-time live-clock">10:45 AM</span>
+          </div>
+          <div class="camera-feed-box" onclick="openSourceModal('CAM-01')">
+            <!-- Real Live Stream Feed from VIGLANCE Backend -->
+            <img id="liveStream" src="/stream.mjpg" alt="CAM-01 Live Feed">
+            <button class="cam-fullscreen-btn" onclick="toggleFullscreen(event, 'cardCam1')" title="Fullscreen">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+            </button>
+            <!-- Overlaid Alert Pills (shown only during live backend events) -->
+            <div class="camera-overlay-alerts" id="camOverlayAlerts"></div>
+          </div>
+        </div>
+
+        <!-- CAM-02 (PARKING AREA) -->
+        <div class="camera-card" id="cardCam2">
+          <div class="camera-header">
+            <div class="camera-header-left">
+              <span>CAM-02 Parking Area - <span class="live-clock">10:45 AM</span></span>
+            </div>
+            <span class="camera-time live-clock">10:45 AM</span>
+          </div>
+          <div class="camera-feed-box">
+            <div class="cam-placeholder">
+              <div class="cctv-grid-overlay"></div>
+              <div class="cctv-reticle"></div>
+              <button class="cam-slot-btn" onclick="openSourceModal('CAM-02')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                + Add Camera Source / Feed
+              </button>
+              <span class="cam-slot-label">CAM-02 Standby / Connect Stream</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- CAM-03 (RESIDENTIAL LANE) -->
+        <div class="camera-card" id="cardCam3">
+          <div class="camera-header">
+            <div class="camera-header-left">
+              <span>CAM-03 Residential Lane - Lane</span>
+            </div>
+            <span class="camera-time live-clock">10:45 AM</span>
+          </div>
+          <div class="camera-feed-box">
+            <div class="cam-placeholder">
+              <div class="cctv-grid-overlay"></div>
+              <div class="cctv-reticle"></div>
+              <button class="cam-slot-btn" onclick="openSourceModal('CAM-03')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                + Add Camera Source / Feed
+              </button>
+              <span class="cam-slot-label">CAM-03 Standby / Connect Stream</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- CAM-04 (LOBBY / COMMUNITY HALL) -->
+        <div class="camera-card" id="cardCam4">
+          <div class="camera-header">
+            <div class="camera-header-left">
+              <span>CAM-04 Lobby / Community Hall</span>
+            </div>
+            <span class="camera-time live-clock">10:45 AM</span>
+          </div>
+          <div class="camera-feed-box">
+            <div class="cam-placeholder">
+              <div class="cctv-grid-overlay"></div>
+              <div class="cctv-reticle"></div>
+              <button class="cam-slot-btn" onclick="openSourceModal('CAM-04')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                + Add Camera Source / Feed
+              </button>
+              <span class="cam-slot-label">CAM-04 Standby / Connect Stream</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- BOTTOM ANALYTICS ROW -->
+      <div class="bottom-analytics-row">
+        <!-- INCIDENT ACTIVITY HEATMAP -->
+        <div class="analytics-card">
+          <div class="card-header-bar">
+            <span class="card-title">Incident Activity</span>
+            <button class="card-more-btn" onclick="toggleTechDrawer()">•••</button>
+          </div>
+          <div class="heatmap-container" id="heatmapGrid"></div>
+        </div>
+
+        <!-- AI CONFIDENCE TRENDLINE -->
+        <div class="analytics-card">
+          <div class="card-header-bar">
+            <span class="card-title">AI Confidence Trend</span>
+            <button class="card-more-btn" onclick="toggleTechDrawer()">•••</button>
+          </div>
+          <div class="chart-container">
+            <svg viewBox="0 0 500 90" preserveAspectRatio="none">
+              <defs>
+                <linearGradient id="trendGradient" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.35"/>
+                  <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.0"/>
+                </linearGradient>
+              </defs>
+              <!-- Grid guide lines -->
+              <line x1="0" y1="20" x2="500" y2="20" stroke="#172238" stroke-dasharray="3 3"/>
+              <line x1="0" y1="50" x2="500" y2="50" stroke="#172238" stroke-dasharray="3 3"/>
+              <line x1="0" y1="80" x2="500" y2="80" stroke="#172238" stroke-dasharray="3 3"/>
+              <!-- Area fill -->
+              <path id="trendArea" d=""/>
+              <!-- Live pair-score curve (was a static demo path) -->
+              <path id="trendLine" d="" fill="none" stroke="#38bdf8" stroke-width="2.6" stroke-linecap="round"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- RIGHT SIDEBAR - ACTIVE ALERTS -->
+    <aside id="alerts-sidebar">
+      <div class="alerts-header">
+        <span class="alerts-header-title">Active Alerts</span>
+        <div class="alerts-clock">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+          <span class="live-clock">10:45 AM</span>
+        </div>
+      </div>
+
+      <!-- Rendered live from /api/status scene verdict + alert_details -->
+      <div class="alerts-list" id="alertsList"></div>
+    </aside>
+  </div>
+</div>
+
+<!-- ADD CAMERA SOURCE / VIDEO MODAL -->
+<div id="sourceModal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h3 id="modalTitle">Configure Camera Source</h3>
+      <button class="modal-close-btn" onclick="closeSourceModal()">&times;</button>
+    </div>
+
+    <div class="modal-tabs">
+      <button class="modal-tab active" id="tabVideo" onclick="setModalTab('video')">Play Video File</button>
+      <button class="modal-tab" id="tabWebcam" onclick="setModalTab('webcam')">Computer Webcam</button>
+      <button class="modal-tab" id="tabRtsp" onclick="setModalTab('rtsp')">RTSP / Stream</button>
+    </div>
+
+    <!-- Video Upload Form -->
+    <form id="uploadVideoForm" class="modal-form" onsubmit="handleUploadVideo(event)">
+      <p style="font-size:12px; color:#94a3b8;">Upload or choose an MP4/AVI/MKV video to feed this surveillance channel:</p>
+      <input type="file" id="videoFileInput" class="modal-input" accept="video/*,.mp4,.avi,.mov,.mkv,.webm" required>
+      <button type="submit" class="modal-submit-btn">Play Video Feed</button>
+    </form>
+
+    <!-- Webcam Form -->
+    <form id="webcamForm" class="modal-form" style="display:none;" onsubmit="handleSwitchWebcam(event)">
+      <p style="font-size:12px; color:#94a3b8;">Connect to a local hardware webcam index:</p>
+      <input type="number" id="webcamIndex" class="modal-input" value="0" min="0" placeholder="Camera Index (default 0)">
+      <button type="submit" class="modal-submit-btn">Connect Webcam</button>
+    </form>
+
+    <!-- RTSP Form -->
+    <form id="rtspForm" class="modal-form" style="display:none;" onsubmit="handleRtspStream(event)">
+      <p style="font-size:12px; color:#94a3b8;">Enter RTSP / HTTP video stream URL:</p>
+      <input type="text" id="rtspUrl" class="modal-input" placeholder="rtsp://admin:password@192.168.1.100:554/stream1">
+      <button type="submit" class="modal-submit-btn">Connect RTSP Stream</button>
+    </form>
+
+    <div id="modalMessage"></div>
+  </div>
+</div>
+
+<!-- TECHNICAL DIAGNOSTICS SLIDE-OVER DRAWER -->
+<div id="techDrawer">
+  <div class="drawer-title">
+    <span>Technical Diagnostics</span>
+    <button style="background:none; border:none; color:#94a3b8; cursor:pointer;" onclick="toggleTechDrawer()">&times;</button>
+  </div>
+  <div>
+    <div style="font-size:11px; color:#64748b; margin-bottom:4px; text-transform:uppercase; font-weight:700;">Live Stream Status</div>
+    <div class="code-box" id="techMeta">Connecting...</div>
+  </div>
+  <div>
+    <div style="font-size:11px; color:#64748b; margin-bottom:4px; text-transform:uppercase; font-weight:700;">AI Models & Checkpoint</div>
+    <div class="code-box" id="techModels">Loading models...</div>
+  </div>
+  <div>
+    <div style="font-size:11px; color:#64748b; margin-bottom:4px; text-transform:uppercase; font-weight:700;">Tracked Persons & Pairs</div>
+    <div class="code-box" id="techPairs">No open pairs</div>
+  </div>
+  <div>
+    <div style="font-size:11px; color:#64748b; margin-bottom:4px; text-transform:uppercase; font-weight:700;">Pipeline Diagnostics</div>
+    <div class="code-box" id="techDiag">{}</div>
+  </div>
+</div>
+
 <script>
-const SCENES={
-  NO_FIGHT:{title:"All clear",detail:"No fighting has been detected.",severity:"calm"},
-  FIGHT:{title:"Possible fight detected",detail:"Two people appear to be fighting. Check this area.",severity:"danger"},
-  MULTI_PERSON_FIGHT:{title:"Group fight detected",detail:"Several people appear to be fighting.",severity:"danger"},
-  GROUP_ASSAULT:{title:"Group assault detected",detail:"A group appears to be attacking someone.",severity:"danger"}
-};
-const WATCHING={title:"Watching",detail:"Analysing the video…",severity:"neutral"};
-const LOST={title:"Video connection lost",detail:"The video feed stopped. Check the camera or video file, then try again.",severity:"danger"};
-const ENDED={title:"Video finished",detail:"Played 3 times. Upload another video or switch source to watch again.",severity:"neutral"};
-const ALERT_WORDS={
-  "Fall Detection":"Someone may have fallen",
-  "Abandoned Bag":"Unattended bag",
-  "Violence/Fight (legacy BiLSTM)":"Possible fight",
-  "Weapon Threat":"Weapon detected",
-  "Fire Threat":"Fire detected",
-  "Smoke Threat":"Smoke detected",
-  "Unattended Bag Candidate":"Unattended bag"
-};
-const CATEGORY_WORDS={weapon:"Weapon",fire:"Fire",smoke:"Smoke",bag:"Bag"};
-const STATE_WORDS={calm:"Status: clear",warning:"Status: check",danger:"Status: alert",neutral:"Status: live"};
-const STATE_TAGS={calm:"Clear",warning:"Check",danger:"Alert",neutral:"Live"};
-const FIGHT_SCENES=["FIGHT","MULTI_PERSON_FIGHT","GROUP_ASSAULT"];
-const ICONS={
- calm:'<svg class="ico" viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 12.4l2.7 2.7L16.2 9.4" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
- warning:'<svg class="ico" viewBox="0 0 24 24" focusable="false"><path d="M12 3.4l9 16.2H3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 9.6v5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="17.2" r="1.2" fill="currentColor"/></svg>',
- danger:'<svg class="ico" viewBox="0 0 24 24" focusable="false"><path d="M8.5 2.8h7L21.2 8.5v7L15.5 21.2h-7L2.8 15.5v-7z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 7.4v5.6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="16.3" r="1.2" fill="currentColor"/></svg>',
- neutral:'<svg class="ico" viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>'
-};
-function put(id,text){document.getElementById(id).textContent=text;}
-function message(text){document.getElementById("sourceMessage").textContent=text;}
-function titleCase(raw){
-  const parts=String(raw===undefined||raw===null?"":raw).split("_").join(" ").split(" ");
-  return parts.filter(function(w){return w.length>0;})
-    .map(function(w){return w.charAt(0).toUpperCase()+w.slice(1);}).join(" ");
+// Live Clocks
+function updateClocks() {
+  const now = new Date();
+  let hours = now.getHours();
+  const minutes = String(now.getMinutes()).padStart(2, "0");
+  const ampm = hours >= 12 ? "PM" : "AM";
+  hours = hours % 12 || 12;
+  const timeStr = `${hours}:${minutes} ${ampm}`;
+  document.querySelectorAll(".live-clock").forEach(el => el.textContent = timeStr);
 }
-function alertWords(key){
-  return Object.prototype.hasOwnProperty.call(ALERT_WORDS,key)?ALERT_WORDS[key]:titleCase(key);
-}
-function categoryWords(key){
-  return Object.prototype.hasOwnProperty.call(CATEGORY_WORDS,key)?CATEGORY_WORDS[key]:titleCase(key);
-}
-function percent(value){
-  const n=Number(value);
-  if(!isFinite(n)) return "unknown";
-  return Math.round(n*100)+"%";
-}
-function allDigits(text){
-  if(!text.length) return false;
-  for(let i=0;i<text.length;i++){const c=text.charCodeAt(i);if(c<48||c>57) return false;}
-  return true;
-}
-function lastSegment(text){
-  let part="",best="",seen=false;
-  for(let i=0;i<text.length;i++){
-    const code=text.charCodeAt(i);
-    if(code===47||code===92){if(part.length) best=part;part="";seen=true;}
-    else part+=text.charAt(i);
-  }
-  if(part.length) best=part;
-  return best.length?best:(seen?text:text);
-}
-function sourceWords(raw){
-  const text=String(raw===undefined||raw===null?"":raw);
-  if(!text.length) return "Not connected";
-  if(allDigits(text)) return "Computer camera";
-  if(text==="synthetic") return "Demo video";
-  return lastSegment(text);
-}
-function clock(seconds){
-  const n=Number(seconds);
-  const total=isFinite(n)&&n>0?n:0;
-  const m=Math.floor(total/60);
-  const s=Math.floor(total%60);
-  return m+":"+(s<10?"0":"")+s;
-}
-function severityOf(event){
-  if(event.scene && event.scene!=="NO_FIGHT") return "danger";
-  return (event.alerts||[]).length?"warning":"calm";
-}
-const LIVE_CAPTION="Live view from the camera. Every frame is processed on this computer.";
-const DEAD_CAPTION="No live picture. Choose the camera or a video file to start watching again.";
-function renderFriendly(s){
-  const running=s.running!==false;
-  const view=!running?((s&&s.ended)?ENDED:LOST):((s.scene&&SCENES[s.scene.verdict])||WATCHING);
-  const hero=document.getElementById("hero");
-  hero.setAttribute("data-severity",view.severity);
-  document.getElementById("heroIcon").innerHTML=ICONS[view.severity];
-  put("heroState",STATE_WORDS[view.severity]);
-  put("heroTitle",view.title);
-  put("heroDetail",view.detail);
-  document.getElementById("stage").setAttribute("data-off",running?"0":"1");
-  put("liveBadge",running?"Live feed":"Stopped");
-  put("videoNote",running?LIVE_CAPTION:DEAD_CAPTION);
+setInterval(updateClocks, 1000);
+updateClocks();
 
-  const people=s.people||[];
-  put("statPeople",String(people.length));
-  put("statPeopleSub",people.length?(people.length===1?"1 person being tracked":"people being tracked"):"No one in view");
-
-  const alerts=(s.alerts||[]).map(alertWords);
-  put("statAlerts",String(alerts.length));
-  put("statAlertsSub",alerts.length?alerts.join(", "):"Nothing to worry about");
-
-  const events=s.timeline||[];
-  put("statIncidents",String(events.length));
-  put("statIncidentsSub",events.length?(events.length===1?"1 incident recorded":"incidents recorded"):"Nothing recorded yet");
-
-  const source=sourceWords(s.source);
-  put("statSource",source);
-  put("statSourceSub",running?"Connected and watching":"Not connected right now");
-  put("statSourceLabel",running?"Watching":"Stopped");
-  put("srcPill",running?source:source+" - stopped");
-
-  const chips=document.getElementById("threatChips");
-  chips.innerHTML=(s.threats||[]).length
-    ? s.threats.map(function(t){
-        return `<span class="chip">${categoryWords(t.category)} spotted &middot; ${percent(t.confidence)}</span>`;
-      }).join("")
-    : "";
-
-  const list=document.getElementById("activity");
-  if(!events.length){
-    const emptyTag=running?"Live":"Offline";
-    const emptyText=running?"Nothing to report yet. Activity will appear here.":"Monitoring is paused until a video source is connected.";
-    list.innerHTML=`<li class="sev-${running?"neutral":"danger"}"><span class="tag">${emptyTag}</span><span class="grow">${emptyText}</span></li>`;
-  }else{
-    list.innerHTML=events.slice(-6).reverse().map(function(event){
-      const known=SCENES[event.scene];
-      const headline=known?known.title:"Activity recorded";
-      const words=(event.alerts||[]).map(alertWords).filter(function(w){
-        return headline.toLowerCase().indexOf(w.toLowerCase())<0;
-      });
-      const severity=severityOf(event);
-      const body=headline+(words.length?" - "+words.join(", "):"");
-      return `<li class="sev-${severity}"><span class="tag">${STATE_TAGS[severity]}</span>`+
-        `<span class="grow">${body}</span><span class="time">${clock(event.start)}</span></li>`;
-    }).join("");
+// Render Heatmap Matrix
+const heatmapGrid = document.getElementById("heatmapGrid");
+const heatColors = [
+  "#141f33", "#141f33", "#141f33", "#0e7490", "#0891b2",
+  "#06b6d4", "#f59e0b", "#f97316", "#ef4444", "#f43f5e"
+];
+// Matrix pattern resembling the density heatmap in reference image
+const heatPattern = [
+  [0, 1, 2, 0, 1, 3, 5, 8, 7, 6, 2, 1, 0, 0, 1, 0, 0, 0],
+  [1, 1, 2, 2, 3, 5, 7, 9, 8, 5, 3, 1, 1, 0, 0, 1, 0, 0],
+  [0, 2, 3, 4, 6, 7, 9, 8, 7, 4, 2, 1, 0, 1, 0, 0, 0, 0],
+  [0, 1, 1, 2, 3, 4, 6, 8, 6, 4, 1, 0, 0, 0, 0, 1, 0, 0]
+];
+for (let r = 0; r < 4; r++) {
+  for (let c = 0; c < 18; c++) {
+    const val = heatPattern[r][c];
+    const cell = document.createElement("div");
+    cell.className = "heatmap-cell";
+    cell.style.backgroundColor = heatColors[val];
+    cell.title = `Slot ${r+1}:${c+1} — Incidents: ${val}`;
+    heatmapGrid.appendChild(cell);
   }
 }
-function dash(value){return value===undefined||value===null?"-":value;}
-function renderTechnical(s){
-  const m=s.model||{};
-  put("model",`ready=${dash(m.ready)}
-head_trained=${dash(m.head_trained)}
-ckpt=${m.checkpoint||"none"}`);
-  put("threatModels",JSON.stringify(s.threat_models||{},null,1));
-  put("diag",JSON.stringify(s.diagnostics||{},null,1));
-  put("meta",`frame ${dash(s.frame)}  t=${dash(s.ts)}s  fps=${dash(s.fps)}  src=${s.source||""}${s.error?"  ERR "+s.error:""}`);
 
-  const people=s.people||[];
-  document.getElementById("people").innerHTML=people.length
-    ? `<table><tr><th>ID</th><th>gen</th><th>bbox</th></tr>`+
-      people.map(function(p){return `<tr><td>${p.id}</td><td>${p.gen}</td><td class="mono">${p.bbox}</td></tr>`;}).join("")+
-      `</table>`
-    : `<p class="empty">no active tracks</p>`;
+// Active Alert Counts
+function updateAlertCounter() {
+  const count = document.querySelectorAll(".alert-card:not([style*='display: none'])").length;
+  document.getElementById("topAlertCount").textContent = count;
+}
 
-  const pairs=s.pairs||[];
-  document.getElementById("pairs").innerHTML=pairs.length
-    ? `<table><tr><th>pair</th><th>score</th><th>buf</th><th>span s</th><th>ready</th><th>dist</th></tr>`+
-      pairs.map(function(p){
-        return `<tr><td>P${p.a}&harr;P${p.b}</td><td>${p.score===null||p.score===undefined?"—":p.score}</td><td>${p.buf}</td><td>${p.span===undefined?"—":p.span}</td><td>${p.ready===undefined?"—":(p.ready?"yes":"no")}</td><td>${p.dist}</td></tr>`;
-      }).join("")+`</table>`
-    : `<p class="empty">no open pairs</p>`;
-
-  const threats=s.threats||[];
-  document.getElementById("threats").innerHTML=threats.length
-    ? `<table><tr><th>source</th><th>label</th><th>category</th><th>confidence</th></tr>`+
-      threats.map(function(t){
-        return `<tr><td>${t.source}</td><td>${t.label}</td><td>${t.category}</td>`+
-          `<td>${percent(t.confidence)} <span class="mono">(${t.confidence})</span></td></tr>`;
-      }).join("")+`</table>`
-    : `<p class="empty">no threat detections</p>`;
-}
-let lastFightNotification="";
-let toastTimer=null;
-async function enableNotifications(){
-  if("Notification" in window && Notification.permission==="default") await Notification.requestPermission();
-}
-function notifyFight(s){
-  const events=s.timeline||[];
-  const event=events.length?events[events.length-1]:null;
-  if(!event||FIGHT_SCENES.indexOf(event.scene)<0) return;
-  const key=event.start+":"+event.scene;
-  if(key===lastFightNotification) return;
-  lastFightNotification=key;
-  const text=(SCENES[event.scene]?SCENES[event.scene].title:"Possible fight detected")+" at "+clock(event.start);
-  const toast=document.getElementById("notification"); toast.textContent=text; toast.hidden=false;
-  clearTimeout(toastTimer); toastTimer=setTimeout(function(){toast.hidden=true;},8000);
-  if("Notification" in window && Notification.permission==="granted") new Notification("VIGLANCE fight alert",{body:text});
-}
-document.getElementById("notifications").onclick=async()=>{
-  await enableNotifications();
-  if(!("Notification" in window)){message("This browser cannot show alerts. Watch the status panel instead.");return;}
-  if(Notification.permission==="granted") message("Fight alerts are on for this device.");
-  else if(Notification.permission==="denied") message("This browser is blocking alerts. Allow notifications for this page in your browser settings to turn them on.");
-  else message("Alerts are still off. Click again and choose Allow when your browser asks.");
-};
-document.getElementById("webcam").onclick=async()=>{
-  await enableNotifications();
-  message("Switching to the computer camera…");
-  try{
-    const r=await fetch("/api/source",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({source:"0"})});
-    if(!r.ok){message("Could not open the camera. Close anything else using it, then try again.");return;}
-    message("Now watching the computer camera.");
-  }catch(e){
-    message("Could not reach the dashboard server. Check that it is still running.");
+// Dismissed alert cards stay dismissed until replaced by newer backend state
+const dismissedAlerts = new Set();
+function dismissAlert(id) {
+  dismissedAlerts.add(id);
+  const card = document.getElementById(id);
+  if (card) {
+    card.style.display = "none";
+    updateAlertCounter();
   }
-};
-document.getElementById("uploadForm").onsubmit=async(e)=>{
+}
+function alertCardId(kind, name) {
+  return "dyn-" + kind + "-" + String(name).toLowerCase().replace(/[^a-z0-9]+/g, "-");
+}
+
+function focusCamera(cardId) {
+  document.querySelectorAll(".camera-card").forEach(c => c.classList.remove("highlight"));
+  const target = document.getElementById(cardId);
+  if (target) {
+    target.classList.add("highlight");
+    target.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+}
+
+function toggleFullscreen(e, cardId) {
+  if (e) e.stopPropagation();
+  const target = document.getElementById(cardId);
+  if (!target) return;
+  const active = document.fullscreenElement || document.webkitFullscreenElement;
+  if (active) {
+    if (document.exitFullscreen) document.exitFullscreen();
+    else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+  } else if (target.requestFullscreen) {
+    target.requestFullscreen().catch(() => {});
+  } else if (target.webkitRequestFullscreen) {
+    target.webkitRequestFullscreen();
+  }
+}
+
+// Modal Management
+let targetSlot = "CAM-01";
+function openSourceModal(slot) {
+  targetSlot = slot;
+  document.getElementById("modalTitle").textContent = `Configure Source for ${slot}`;
+  document.getElementById("modalMessage").textContent = "";
+  document.getElementById("sourceModal").style.display = "flex";
+}
+function closeSourceModal() {
+  document.getElementById("sourceModal").style.display = "none";
+}
+function setModalTab(tab) {
+  document.querySelectorAll(".modal-tab").forEach(t => t.classList.remove("active"));
+  document.getElementById("uploadVideoForm").style.display = "none";
+  document.getElementById("webcamForm").style.display = "none";
+  document.getElementById("rtspForm").style.display = "none";
+
+  if (tab === "video") {
+    document.getElementById("tabVideo").classList.add("active");
+    document.getElementById("uploadVideoForm").style.display = "flex";
+  } else if (tab === "webcam") {
+    document.getElementById("tabWebcam").classList.add("active");
+    document.getElementById("webcamForm").style.display = "flex";
+  } else {
+    document.getElementById("tabRtsp").classList.add("active");
+    document.getElementById("rtspForm").style.display = "flex";
+  }
+}
+
+async function handleUploadVideo(e) {
   e.preventDefault();
-  const file=document.getElementById("videoFile").files[0];
-  if(!file){message("Choose a video file first.");return;}
-  await enableNotifications();
-  message("Opening "+file.name+"…");
-  try{
-    const body=new FormData(); body.append("video",file,file.name);
-    const r=await fetch("/api/upload",{method:"POST",body});
-    if(!r.ok){message("That video could not be opened. Try an MP4, MOV, AVI or MKV file.");return;}
-    message("Now playing "+file.name+".");
-  }catch(e){
-    message("Could not reach the dashboard server. Check that it is still running.");
+  const file = document.getElementById("videoFileInput").files[0];
+  if (!file) return;
+  const msg = document.getElementById("modalMessage");
+  msg.textContent = "Uploading video feed...";
+  try {
+    const formData = new FormData();
+    formData.append("video", file, file.name);
+    const res = await fetch("/api/upload", { method: "POST", body: formData });
+    if (res.ok) {
+      msg.textContent = `Streaming ${file.name} successfully!`;
+      setTimeout(closeSourceModal, 1000);
+    } else {
+      msg.textContent = "Error loading video file.";
+    }
+  } catch (err) {
+    msg.textContent = "Server communication error.";
   }
-};
-async function tick(){
-  try{
-    const s=await (await fetch("/api/status")).json();
-    notifyFight(s);
-    renderFriendly(s);
-    renderTechnical(s);
-  }catch(e){/* stream still starting */}
 }
-setInterval(tick,500); tick();
-</script></body></html>
+
+async function handleSwitchWebcam(e) {
+  e.preventDefault();
+  const idx = document.getElementById("webcamIndex").value || "0";
+  const msg = document.getElementById("modalMessage");
+  msg.textContent = "Connecting to webcam...";
+  try {
+    const res = await fetch("/api/source", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: idx })
+    });
+    if (res.ok) {
+      msg.textContent = `Webcam ${idx} connected!`;
+      setTimeout(closeSourceModal, 1000);
+    } else {
+      msg.textContent = "Could not open specified camera.";
+    }
+  } catch (err) {
+    msg.textContent = "Server communication error.";
+  }
+}
+
+async function handleRtspStream(e) {
+  e.preventDefault();
+  const url = document.getElementById("rtspUrl").value.trim();
+  const msg = document.getElementById("modalMessage");
+  if (!url) {
+    msg.textContent = "Please provide an RTSP stream URL.";
+    return;
+  }
+  msg.textContent = "Connecting to stream...";
+  try {
+    const res = await fetch("/api/source", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: url })
+    });
+    if (res.ok) {
+      msg.textContent = `Streaming from configured source.`;
+      setTimeout(closeSourceModal, 1200);
+    } else {
+      msg.textContent = "Could not open that stream URL.";
+    }
+  } catch (err) {
+    msg.textContent = "Server communication error.";
+  }
+}
+
+// Toggle Tech Drawer
+function toggleTechDrawer() {
+  document.getElementById("techDrawer").classList.toggle("open");
+}
+
+// ---- Live alert + trend state (all values below come from /api/status) ----
+const FIGHT_SCENES = ["FIGHT", "MULTI_PERSON_FIGHT", "GROUP_ASSAULT"];
+const FIGHT_TITLES = {
+  FIGHT: "Possible Fight Detected",
+  MULTI_PERSON_FIGHT: "Group Fight Detected",
+  GROUP_ASSAULT: "Group Assault Detected"
+};
+const ALERT_WORDS = {
+  "Fall Detection": "Fall Detected",
+  "Abandoned Bag": "Unattended Bag",
+  "Unattended Bag Candidate": "Unattended Bag",
+  "Violence/Fight (legacy BiLSTM)": "Possible Fight",
+  "Weapon Threat": "Weapon Detected",
+  "Fire Threat": "Fire Detected",
+  "Smoke Threat": "Smoke Detected"
+};
+function alertWords(key) {
+  if (Object.prototype.hasOwnProperty.call(ALERT_WORDS, key)) return ALERT_WORDS[key];
+  return String(key).replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+}
+function escHtml(text) {
+  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function alertCardHTML(id, title, cam, confPct, reason) {
+  const conf = (confPct === null || confPct === undefined)
+    ? "" : `<div class="alert-confidence">Confidence: <span>${confPct}%</span></div>`;
+  return `<div class="alert-card" id="${id}">` +
+    `<div class="alert-top"><span class="alert-title">${escHtml(title)}</span>` +
+    `<span class="alert-cam">${escHtml(cam)}</span></div>${conf}` +
+    `<div class="alert-reasoning">Reasoning: ${escHtml(reason)}</div>` +
+    `<div class="alert-actions">` +
+    `<button class="btn-view-live" onclick="focusCamera('cardCam1')">View Live</button>` +
+    `<button class="btn-dismiss" onclick="dismissAlert('${id}')">Dismiss</button></div></div>`;
+}
+function sceneReason(s) {
+  const incidents = (s.scene && s.scene.incidents) || [];
+  const parts = incidents.map(inc =>
+    `${(inc.members || []).length} people, ${inc.violent_edges || 0} violent link(s)`);
+  return parts.length ? parts.join("; ") : "Violent interaction detected";
+}
+function topPairScore(s) {
+  let top = null;
+  for (const p of (s.pairs || [])) {
+    if (p.score !== null && p.score !== undefined && (top === null || p.score > top)) top = p.score;
+  }
+  return top;
+}
+function renderAlerts(s) {
+  const list = document.getElementById("alertsList");
+  const details = s.alert_details || {};
+  const verdict = s.scene ? s.scene.verdict : "NO_FIGHT";
+  let html = "";
+  let count = 0;
+  function push(id, title, cam, confPct, reason) {
+    if (dismissedAlerts.has(id)) return;
+    count++;
+    html += alertCardHTML(id, title, cam, confPct, reason);
+  }
+  if (FIGHT_SCENES.indexOf(verdict) >= 0) {
+    const top = topPairScore(s);
+    push("dyn-fight", FIGHT_TITLES[verdict] || FIGHT_TITLES.FIGHT,
+      "(CAM-01 Live Feed)", top === null ? null : Math.round(top * 100),
+      sceneReason(s));
+  }
+  Object.keys(details).forEach(function (name) {
+    const d = details[name] || {};
+    const conf = (d.confidence === null || d.confidence === undefined)
+      ? null : Math.round(d.confidence * 100);
+    push(alertCardId("alert", name), alertWords(name), "(CAM-01 Live Feed)",
+      conf, d.message || alertWords(name));
+  });
+  if (!count) {
+    html = `<div class="alert-card calm"><div class="alert-top">` +
+      `<span class="alert-title">No active alerts</span></div>` +
+      `<div class="alert-reasoning">Monitoring is running. New detections will appear here.</div></div>`;
+  }
+  list.innerHTML = html;
+  document.getElementById("topAlertCount").textContent = count;
+}
+
+// Camera overlay pills: only the live CAM-01 slot, only during real events
+function renderOverlayPills(s) {
+  const box = document.getElementById("camOverlayAlerts");
+  if (!box) return;
+  const verdict = s.scene ? s.scene.verdict : "NO_FIGHT";
+  const names = Object.keys(s.alert_details || {});
+  let html = "";
+  if (FIGHT_SCENES.indexOf(verdict) >= 0) {
+    const top = topPairScore(s);
+    html += `<div class="cam-alert-tag"><svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 4l7.5 13h-15L12 6zm-1 5v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>` +
+      `Alert: Possible Fight${top === null ? "" : " " + Math.round(top * 100) + "%"}</div>`;
+  }
+  names.forEach(function (name) {
+    html += `<div class="cam-alert-tag"><svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 4l7.5 13h-15L12 6zm-1 5v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>` +
+      `Alert: ${escHtml(alertWords(name))}</div>`;
+  });
+  box.innerHTML = html;
+}
+
+// AI confidence trendline from live top pair scores (last 40 polls)
+const scoreHistory = [];
+function renderTrend() {
+  const line = document.getElementById("trendLine");
+  const area = document.getElementById("trendArea");
+  if (!line) return;
+  const N = 40, W = 500, H = 90;
+  const hist = scoreHistory.slice(-N);
+  while (hist.length < 2) hist.unshift(0);
+  const full = hist.slice();
+  while (full.length < N) full.unshift(full[0]);
+  let d = "";
+  full.forEach(function (v, i) {
+    const x = (i / (N - 1)) * W;
+    const y = H - 6 - Math.max(0, Math.min(1, v)) * (H - 16);
+    d += (i ? "L" : "M") + x.toFixed(1) + " " + y.toFixed(1);
+  });
+  line.setAttribute("d", d);
+  if (area) area.setAttribute("d", d + `L ${W} ${H} L 0 ${H} Z`);
+}
+
+// Dynamic Backend Polling (/api/status)
+async function pollBackend() {
+  try {
+    const res = await fetch("/api/status");
+    if (!res.ok) return;
+    const s = await res.json();
+
+    // Update Latency / FPS
+    if (s.fps) {
+      const lat = (1.0 / Math.max(s.fps, 1)).toFixed(2);
+      document.getElementById("latencyVal").textContent = `${lat}s`;
+    }
+
+    document.getElementById("camCount").textContent = (s.running !== false) ? "1" : "0";
+
+    renderAlerts(s);
+    renderOverlayPills(s);
+
+    const top = topPairScore(s);
+    scoreHistory.push(top === null ? 0 : top);
+    if (scoreHistory.length > 120) scoreHistory.splice(0, scoreHistory.length - 120);
+    renderTrend();
+
+    // Populate Tech Drawer info
+    document.getElementById("techMeta").textContent =
+      `Frame: ${s.frame || 0} | FPS: ${s.fps || 0} | Source: ${s.source || "None"}
+Scene Verdict: ${s.scene ? s.scene.verdict : "NO_FIGHT"}`;
+    document.getElementById("techModels").textContent = JSON.stringify(s.model || {}, null, 2);
+    document.getElementById("techPairs").textContent =
+      `Active Persons: ${(s.people || []).length}
+Open Pairs: ${(s.pairs || []).length}
+` +
+      JSON.stringify(s.pairs || [], null, 2);
+    document.getElementById("techDiag").textContent = JSON.stringify(s.diagnostics || {}, null, 2);
+
+  } catch (e) {
+    // Polling failure / starting up
+  }
+}
+setInterval(pollBackend, 500);
+pollBackend();
+</script>
+</body>
+</html>
 """
 
 
@@ -976,6 +1879,15 @@ def parse_args(argv=None):
                    help="use only the local auxiliary YOLO weights")
     p.add_argument("--surveillance-weights", default=None,
                    help="local weights for the surveillance YOLO model")
+    p.add_argument("--telegram", action="store_true",
+                   help="enable Telegram incident alerts (needs chat id + token)")
+    p.add_argument("--telegram-chat-id", default=None)
+    p.add_argument("--telegram-bot-token", default=None,
+                   help="prefer VIGILANCE_TELEGRAM_BOT_TOKEN env var instead")
+    p.add_argument("--telegram-cooldown", type=float, default=None,
+                   help="minimum seconds between Telegram messages")
+    p.add_argument("--telegram-test", action="store_true",
+                   help="send one test photo+message via Telegram and exit")
     p.add_argument("--log-level", default=None)
     return p.parse_args(argv)
 
@@ -988,6 +1900,32 @@ def main(argv=None) -> int:
     cfg.from_env()
     cfg.apply_overrides(source=None if args.synthetic else args.source)
     setup_logging(args.log_level or cfg.log_level)
+
+    if args.telegram_test:
+        from core.alert_dispatch import Incident, TelegramConfig, TelegramNotifier
+        token = args.telegram_bot_token or cfg.telegram_bot_token
+        tcfg = TelegramConfig(
+            enabled=True, bot_token=token,
+            chat_id=args.telegram_chat_id or cfg.telegram_chat_id,
+            cooldown_sec=0.0,
+        )
+        notifier = TelegramNotifier(tcfg)
+        if not notifier.ready:
+            print("telegram-test ABORT: need --telegram-chat-id and "
+                  "VIGILANCE_TELEGRAM_BOT_TOKEN")
+            return 2
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        cv2.putText(frame, "VIGLANCE telegram test", (20, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        ok, buf = cv2.imencode(".jpg", frame)
+        incident = Incident(key="telegram-test", title="TEST: fight detected",
+                            scene="FIGHT", alerts=["Violence/Fight"],
+                            timestamp=0.0)
+        sent = notifier.maybe_notify(incident,
+                                     bytes(buf) if ok else None, now=0.0)
+        print("telegram-test " + ("SENT - check your chat" if sent
+                                  else "FAILED - see log"))
+        return 0 if sent else 1
 
     from tests.conftest import FakeDetector, black_frames
     fire_on = cfg.enable_fire and not args.no_fire and not args.synthetic
@@ -1045,10 +1983,31 @@ def main(argv=None) -> int:
         )
 
     state = LiveState()
+    notifier = None
+    if args.telegram or cfg.telegram_enabled:
+        from core.alert_dispatch import TelegramConfig, TelegramNotifier
+        token = args.telegram_bot_token or cfg.telegram_bot_token
+        tcfg = TelegramConfig(
+            enabled=True,
+            bot_token=token,
+            chat_id=args.telegram_chat_id or cfg.telegram_chat_id,
+            cooldown_sec=(args.telegram_cooldown
+                          if args.telegram_cooldown is not None
+                          else cfg.telegram_cooldown_sec),
+            notify_fight=True, notify_fall=True, notify_fire=True,
+            notify_bag=cfg.telegram_notify_bag,
+            notify_weapon=cfg.telegram_notify_weapon,
+        )
+        notifier = TelegramNotifier(tcfg)
+        if notifier.ready:
+            log.info("event=telegram_ready cooldown=%.0fs", tcfg.cooldown_sec)
+        else:
+            log.warning("event=telegram_not_configured "
+                        "(need --telegram-chat-id and VIGILANCE_TELEGRAM_BOT_TOKEN)")
     pump = threading.Thread(target=pump_frames,
                             args=(state, pipeline,
                                   cfg.source if frames is None else source_label,
-                                  cfg.fps, frames, threat_detector),
+                                  cfg.fps, frames, threat_detector, notifier),
                             daemon=True)
     pump.start()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(state))

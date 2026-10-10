@@ -12,7 +12,78 @@ import pytest
 
 cv2 = pytest.importorskip("cv2")
 
-from ui import LiveState, make_handler, parse_args, pump_frames
+from ui import LiveState, make_handler, open_capture, parse_args, pump_frames
+
+
+class _FakeCap:
+    def __init__(self, frame=None):
+        self._frame = frame
+        self.released = False
+
+    def isOpened(self):
+        return True
+
+    def read(self):
+        if self._frame is None:
+            return False, None
+        return True, self._frame
+
+    def get(self, prop):
+        return 30.0
+
+    def release(self):
+        self.released = True
+
+
+def _patch_capture(monkeypatch, frames_by_backend):
+    """Map backend -> frame (None = open-but-no-frames). Records attempts."""
+    import cv2 as _cv2
+
+    attempts = []
+
+    def fake_capture(src, backend=None):
+        attempts.append(backend)
+        return _FakeCap(frames_by_backend.get(backend))
+
+    monkeypatch.setattr(_cv2, "VideoCapture", fake_capture)
+    return attempts
+
+
+def test_open_capture_tries_dshow_fallback_for_webcam(monkeypatch):
+    import cv2 as _cv2
+    import numpy as np
+
+    good = np.zeros((480, 640, 3), dtype=np.uint8)
+    attempts = _patch_capture(monkeypatch, {None: None, _cv2.CAP_DSHOW: good})
+    cap, backend = open_capture("0")
+    assert cap is not None and backend == str(_cv2.CAP_DSHOW)
+    assert attempts[0] is None  # default tried first
+    # webcam probe frame is consumed once at open; stream continues after it
+    ok, frame = cap.read()
+    assert ok and frame is not None
+
+
+def test_open_capture_single_attempt_for_files(monkeypatch):
+    attempts = _patch_capture(monkeypatch, {})
+    cap, error = open_capture("clip.mp4")
+    assert cap is None and "tried backends: default" in error
+    assert len(attempts) == 1
+
+
+def test_open_capture_rejects_empty_frames(monkeypatch):
+    import numpy as np
+
+    attempts = _patch_capture(monkeypatch, {None: np.zeros((0, 0, 3), dtype=np.uint8)})
+    cap, error = open_capture("0")
+    assert cap is None and "close other apps" in error
+    assert len(attempts) == 3  # default + DSHOW + MSMF, all bad
+
+
+def test_dashboard_has_fullscreen_button(live_state):
+    port, _ = live_state
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as r:
+        html = r.read().decode()
+    assert "toggleFullscreen" in html and "cam-fullscreen-btn" in html
 
 
 @pytest.fixture()
@@ -53,12 +124,13 @@ def test_status_endpoint_shape(live_state):
         assert r.status == 200
         body = json.loads(r.read())
     for key in ("running", "frame", "fps", "people", "pairs", "scene",
-                "model", "alerts", "threats", "threat_models", "timeline",
-                "diagnostics"):
+                "model", "alerts", "alert_details", "threats", "threat_models",
+                "timeline", "diagnostics"):
         assert key in body, key
     assert body["running"] is True
     assert isinstance(body["people"], list) and len(body["people"]) >= 1
     assert set(body["model"]) >= {"ready", "head_trained", "checkpoint"}
+    assert isinstance(body["alert_details"], dict)
 
 
 def test_snapshot_is_jpeg(live_state):
@@ -76,6 +148,26 @@ def test_dashboard_serves_html(live_state):
         html = r.read().decode()
     assert ("VIGLANCE" in html and "/stream.mjpg" in html
             and "/api/status" in html and "/api/upload" in html)
+    # alerts render live from the backend: no hardcoded demo cards/scores
+    assert "alertsList" in html and "renderAlerts" in html
+    assert "alertCard1" not in html and "cam1Alert1" not in html
+    assert "81%" not in html and "Alert: Unattended Bag" not in html
+
+
+def test_alert_details_helper():
+    from ui import _alert_details
+    out = _alert_details(
+        {"Fall Detection": {"alert": True, "confidence": 0.77,
+                            "message": "Person 2 is down."}},
+        {"Fire Threat": {"alert": True, "confidence": 0.91,
+                         "message": "Fire!"}},
+    )
+    assert out == {
+        "Fall Detection": {"confidence": 0.77, "message": "Person 2 is down."},
+        "Fire Threat": {"confidence": 0.91, "message": "Fire!"},
+    }
+    assert _alert_details({"X": "junk"}, {}) == {}
+    assert _alert_details({}, {}) == {}
 
 
 def test_ui_source_defaults_to_config_value():
