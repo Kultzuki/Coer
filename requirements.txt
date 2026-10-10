@@ -1,0 +1,12 @@
+# --- runtime (inference) ---
+# Heavy ML deps are version-floored, not pinned, so Kaggle (which pre-installs
+# torch) and local Windows installs both resolve. Only numpy is needed for
+# config, TrackedPerson, replay-harness and the smoke tests.
+numpy>=1.24
+opencv-python>=4.8
+ultralytics>=8.2
+huggingface_hub>=0.24
+torch>=2.2
+
+# --- tests ---
+pytest>=7.4

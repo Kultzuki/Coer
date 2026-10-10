@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+*.pt
+!yolo26m.pt
+!yolo26m-pose.pt
+*.onnx
+*.engine
+evidence/
+*.jsonl
+.vscode/
+.idea/
+# local env / tooling (never push)
+.venv/
+.kilo/
+.omo/
+.opencode/
+.codegraph/
+.pytest_cache/
+# partial downloads
+*.part
+# runtime-downloaded aux models
+weights/
+# eval datasets + large videos (friend doing UI work doesn't need these;
+# keep test1.mp4 as a tiny sample for UI testing)
+Fight-videos/
+No-FIGHT/
+*.mp4
+!test1.mp4

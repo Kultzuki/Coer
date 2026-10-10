@@ -1,0 +1,5 @@
+{
+  "best_validation_loss": 0.35026962231844666,
+  "epochs": 25,
+  "best_checkpoint": "/kaggle/working/viglance/training/best_fight_stgcnpp_v1.pth"
+}
