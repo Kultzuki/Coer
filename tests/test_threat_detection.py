@@ -69,7 +69,7 @@ def test_threat_weights_argument_is_ignored():
 
 def test_weapon_alert_needs_high_confidence_streak():
     detector = _detector(enable_weapon_alerts=True)
-    detector.models = {"surveillance": _model("short-gun", 0.8)}
+    detector.models = {"surveillance": _model("short-gun", 0.9)}
     frame = np.zeros((80, 80, 3), dtype=np.uint8)
     assert "Weapon Threat" not in detector.detect(frame).alerts
     assert "Weapon Threat" in detector.detect(frame).alerts
@@ -89,3 +89,28 @@ def test_low_confidence_weapon_never_alerts():
     frame = np.zeros((80, 80, 3), dtype=np.uint8)
     for _ in range(5):
         assert "Weapon Threat" not in detector.detect(frame).alerts
+
+
+def test_fire_alert_needs_high_confidence_streak():
+    detector = _detector()
+    detector.models = {"surveillance": _model("fire", 0.9)}
+    frame = np.zeros((80, 80, 3), dtype=np.uint8)
+    assert "Fire Threat" not in detector.detect(frame).alerts
+    assert "Fire Threat" in detector.detect(frame).alerts
+
+
+def test_fire_alert_respects_enable_flag():
+    detector = _detector(enable_fire_alerts=False)
+    detector.models = {"surveillance": _model("fire", 0.8)}
+    frame = np.zeros((80, 80, 3), dtype=np.uint8)
+    for _ in range(5):
+        assert "Fire Threat" not in detector.detect(frame).alerts
+        assert "Smoke Threat" not in detector.detect(frame).alerts
+
+
+def test_bag_alert_dark_by_default():
+    detector = _detector()
+    detector.models = {"surveillance": _model("bag", 0.8)}
+    frame = np.zeros((80, 80, 3), dtype=np.uint8)
+    for _ in range(5):
+        assert "Unattended Bag Candidate" not in detector.detect(frame).alerts

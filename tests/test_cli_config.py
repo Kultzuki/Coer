@@ -50,18 +50,25 @@ def test_legacy_fight_flag_and_env(tmp_path, monkeypatch):
     assert cfg.enable_legacy_fight is True
 
 @pytest.mark.parametrize("path", ["config/default.json"])
-def test_default_config_is_violence_only(path):
+def test_default_config_is_violence_fire_fall_only(path):
     cfg = VigilanceConfig.from_file(path)
     cfg.validate()
     assert cfg.enable_fight is True
-    assert cfg.enable_fall is False
+    assert cfg.enable_fire is True
+    assert cfg.enable_fall is True
     assert cfg.enable_bag is False
     assert cfg.enable_legacy_fight is False
     assert cfg.enable_threats is False
 
 
-def test_violence_only_pipeline_registers_no_other_scenarios():
+def test_violence_fire_fall_pipeline_registers_no_other_scenarios():
     from core.pipeline import Pipeline
     from tests.conftest import FakeDetector
     pipe = Pipeline(config=VigilanceConfig(), detector=FakeDetector([[]]))
-    assert [name for name, _, _ in pipe._scenarios] == []
+    assert sorted(name for name, _, _ in pipe._scenarios) == ["Fall Detection"]
+
+def test_fire_enabled_by_default_with_env_override(monkeypatch):
+    from config import VigilanceConfig
+    assert VigilanceConfig().enable_fire is True
+    monkeypatch.setenv("VIGILANCE_ENABLE_FIRE", "0")
+    assert VigilanceConfig().from_env().enable_fire is False

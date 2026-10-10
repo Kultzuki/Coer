@@ -65,7 +65,7 @@ class SceneVerdict:
 
 @dataclass
 class GraphConfig:
-    violence_edge_threshold: float = 0.3
+    violence_edge_threshold: float = 0.5
     minimum_edges_for_group_assault: int = 2
     minimum_people_for_multi_person_fight: int = 3
     minimum_violent_degree_for_group_assault: int = 2

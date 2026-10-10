@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass, field
 
 @dataclass
 class FightGraphConfig:
-    violence_edge_threshold: float = 0.3
+    violence_edge_threshold: float = 0.5
     minimum_edges_for_group_assault: int = 2
     minimum_people_for_multi_person_fight: int = 3
     minimum_violent_degree_for_group_assault: int = 2
@@ -66,12 +66,13 @@ class VigilanceConfig:
     # --- track lifecycle (registry) ---
     lost_timeout_sec: float = 1.0  # gap without sighting before LOST
     lost_grace_sec: float = 5.0  # LOST retention before REMOVED
-    # --- scenario enable/disable (violence-only focus; re-enable others explicitly) ---
-    enable_fall: bool = False
+    # --- scenario enable/disable (violence + fire + fall focus; re-enable others explicitly) ---
+    enable_fall: bool = True  # pose-rule fall module (no extra weights)
     enable_bag: bool = False
     enable_fight: bool = True  # ST-GCN++ pair/graph fight path (the active fight path)
     enable_legacy_fight: bool = False  # legacy BiLSTM first-two-person module; opt-in only
     enable_threats: bool = False  # auxiliary YOLO threat model (weapon/fire/bag); opt-in only
+    enable_fire: bool = True  # fire/smoke alerts from the threat model; violence + fire focus
     # --- thresholds ---
     fight_threshold: float = 0.65
     fight_sequence_length: int = 30
@@ -152,6 +153,7 @@ class VigilanceConfig:
             ("lost_timeout_sec", float), ("lost_grace_sec", float),
             ("enable_fall", bool), ("enable_bag", bool), ("enable_fight", bool),
             ("enable_legacy_fight", bool), ("enable_threats", bool),
+            ("enable_fire", bool),
             ("fight_threshold", float), ("fight_sequence_length", int),
             ("fight_confirm_frames", int), ("fall_angle_deg", float),
             ("fall_stillness_sec", float), ("fall_min_visible_sec", float),

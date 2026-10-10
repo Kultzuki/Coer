@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 import uuid
 
+import numpy as np
 import pytest
 
 cv2 = pytest.importorskip("cv2")
@@ -85,6 +86,50 @@ def test_ui_source_defaults_to_config_value():
 def test_threats_opt_in_not_default():
     args = parse_args([])
     assert args.threats is False and args.no_threats is False
+
+
+def test_no_fire_flag_default_off():
+    assert parse_args([]).no_fire is False
+    assert parse_args(["--no-fire"]).no_fire is True
+
+
+def test_uploaded_video_plays_three_times_then_ends(tmp_path):
+    import cv2
+
+    from config import VigilanceConfig
+    from core.pipeline import Pipeline
+    from tests.conftest import FakeDetector
+
+    path = str(tmp_path / "clip.avi")
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"),
+                             5.0, (64, 48))
+    for _ in range(3):
+        writer.write(np.zeros((48, 64, 3), dtype=np.uint8))
+    writer.release()
+
+    cfg = VigilanceConfig()
+    pipe = Pipeline(config=cfg, detector=FakeDetector([[]]))
+    state = LiveState()
+    pump = threading.Thread(target=pump_frames,
+                            args=(state, pipe, path, 5.0),
+                            daemon=True)
+    pump.start()
+    try:
+        ended = False
+        for _ in range(600):
+            with state.lock:
+                ended = bool(state.status.get("ended")) and not state.status.get("running")
+            if ended:
+                break
+            time.sleep(0.05)
+        assert ended, "video did not reach ended state"
+        # Each replay resets the pipeline, so the counter holds exactly the
+        # final play's frames; reaching "ended" at all (instead of looping
+        # forever) is the regression under test.
+        assert pipe.frame_index == 3
+    finally:
+        state.stop = True
+        pump.join(timeout=10)
 
 
 def test_pair_payload_carries_readiness(live_state):

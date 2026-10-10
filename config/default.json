@@ -11,11 +11,12 @@
   "max_people": 32,
   "lost_timeout_sec": 1.0,
   "lost_grace_sec": 5.0,
-  "enable_fall": false,
+  "enable_fall": true,
   "enable_bag": false,
   "enable_fight": true,
   "enable_legacy_fight": false,
   "enable_threats": false,
+  "enable_fire": true,
   "fight_threshold": 0.65,
   "fight_sequence_length": 30,
   "fight_confirm_frames": 5,
@@ -42,7 +43,7 @@
       "autoload": true
     },
     "graph": {
-      "violence_edge_threshold": 0.3,
+      "violence_edge_threshold": 0.5,
       "minimum_edges_for_group_assault": 2,
       "minimum_people_for_multi_person_fight": 3,
       "minimum_violent_degree_for_group_assault": 2

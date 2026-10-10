@@ -38,6 +38,11 @@ from core.video_upload import (MAX_UPLOAD_BYTES, VideoUploadError,
 
 log = get_logger("ui")
 
+#: Uploaded/file videos play at most this many times, then stop on an
+#: "ended" status instead of looping forever. Webcams (digit sources) and
+#: the synthetic demo are unaffected.
+MAX_VIDEO_PLAYS = 3
+
 try:
     import cv2
 except ImportError as exc:
@@ -190,6 +195,7 @@ def pump_frames(state: LiveState, pipeline: Pipeline, source, fps_fallback: floa
     current_generation = 0
     fps = float(fps_fallback)
     idx, last, ema = 0, time.perf_counter(), None
+    plays, ended = 0, False
     try:
         while not state.stop:
             if synthetic_frames is None:
@@ -205,8 +211,9 @@ def pump_frames(state: LiveState, pipeline: Pipeline, source, fps_fallback: floa
                         threat_detector.reset()
                     state.reset_timeline()
                     idx, ema = 0, None
+                    plays, ended = 0, False
 
-                if cap is None:
+                if cap is None and not ended:
                     src: object = (int(current_source)
                                    if str(current_source).isdigit()
                                    else current_source)
@@ -223,17 +230,39 @@ def pump_frames(state: LiveState, pipeline: Pipeline, source, fps_fallback: floa
                         time.sleep(0.1)
                         continue
                     fps = float(cap.get(cv2.CAP_PROP_FPS) or fps_fallback)
+                    pipeline.reset()
+                    if threat_detector is not None:
+                        threat_detector.reset()
+                if cap is None:
+                    time.sleep(0.1)
+                    continue
                 ok, frame = cap.read()
                 if not ok:
                     cap.release()
                     cap = None
-                    timeline = state.timeline_snapshot()
-                    with state.lock:
-                        state.status = {
-                            "running": False,
-                            "source": current_source,
-                            "timeline": timeline,
-                        }
+                    if str(current_source).isdigit():
+                        timeline = state.timeline_snapshot()
+                        with state.lock:
+                            state.status = {
+                                "running": False,
+                                "source": current_source,
+                                "timeline": timeline,
+                            }
+                        time.sleep(0.1)
+                        continue
+                    plays += 1
+                    if plays >= MAX_VIDEO_PLAYS:
+                        ended = True
+                        timeline = state.timeline_snapshot()
+                        with state.lock:
+                            state.status = {
+                                "running": False,
+                                "source": current_source,
+                                "timeline": timeline,
+                                "ended": True,
+                            }
+                        log.info("event=ui_replay_finished source=%s plays=%d",
+                                 current_source, plays)
                     time.sleep(0.1)
                     continue
             else:
@@ -604,6 +633,7 @@ const SCENES={
 };
 const WATCHING={title:"Watching",detail:"Analysing the video…",severity:"neutral"};
 const LOST={title:"Video connection lost",detail:"The video feed stopped. Check the camera or video file, then try again.",severity:"danger"};
+const ENDED={title:"Video finished",detail:"Played 3 times. Upload another video or switch source to watch again.",severity:"neutral"};
 const ALERT_WORDS={
   "Fall Detection":"Someone may have fallen",
   "Abandoned Bag":"Unattended bag",
@@ -678,7 +708,7 @@ const LIVE_CAPTION="Live view from the camera. Every frame is processed on this 
 const DEAD_CAPTION="No live picture. Choose the camera or a video file to start watching again.";
 function renderFriendly(s){
   const running=s.running!==false;
-  const view=!running?LOST:((s.scene&&SCENES[s.scene.verdict])||WATCHING);
+  const view=!running?((s&&s.ended)?ENDED:LOST):((s.scene&&SCENES[s.scene.verdict])||WATCHING);
   const hero=document.getElementById("hero");
   hero.setAttribute("data-severity",view.severity);
   document.getElementById("heroIcon").innerHTML=ICONS[view.severity];
@@ -936,6 +966,8 @@ def parse_args(argv=None):
     p.add_argument("--no-fight", action="store_true")
     p.add_argument("--no-threats", action="store_true",
                    help="disable the auxiliary YOLO threat model")
+    p.add_argument("--no-fire", action="store_true",
+                   help="disable fire/smoke alerts from the threat model")
     p.add_argument("--threats", action="store_true",
                    help="opt in to the auxiliary YOLO threat model (OFF by default; violence-only focus)")
     p.add_argument("--enable-weapon-alerts", action="store_true",
@@ -958,10 +990,12 @@ def main(argv=None) -> int:
     setup_logging(args.log_level or cfg.log_level)
 
     from tests.conftest import FakeDetector, black_frames
+    fire_on = cfg.enable_fire and not args.no_fire and not args.synthetic
     threats_on = ((args.threats or cfg.enable_threats)
                   and not args.no_threats and not args.synthetic)
+    use_threat_detector = threats_on or fire_on
     use_auxiliary_threats = threats_on
-    if use_auxiliary_threats:
+    if use_threat_detector:
         cfg.enable_bag = False
     if args.synthetic:
         script = [[(1, 60.0), (2, 220.0)], [(1, 64.0), (2, 216.0), (3, 380.0)],
@@ -996,7 +1030,7 @@ def main(argv=None) -> int:
         pipeline.load_fight_model()
 
     threat_detector = None
-    if threats_on:
+    if use_threat_detector:
         from core.threat_detection import SurveillanceThreatDetector
         threat_detector = SurveillanceThreatDetector(
             surveillance_weights=args.surveillance_weights,
@@ -1006,6 +1040,8 @@ def main(argv=None) -> int:
             device=cfg.device,
             bag_proximity_px=cfg.bag_proximity_px,
             enable_weapon_alerts=args.enable_weapon_alerts,
+            enable_fire_alerts=fire_on,
+            enable_bag_alerts=False,
         )
 
     state = LiveState()

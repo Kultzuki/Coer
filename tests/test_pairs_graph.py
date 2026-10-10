@@ -362,7 +362,7 @@ def test_fight_config_defaults_and_parity():
     assert set(vars(fc.graph)) == set(vars(GraphConfig()))
     cfg = VigilanceConfig.from_file("config/default.json")
     cfg.validate()
-    assert cfg.fight_cfg.graph.violence_edge_threshold == 0.3
+    assert cfg.fight_cfg.graph.violence_edge_threshold == 0.5
 
 
 # end-to-end pipeline scenarios -------------------------------------------------------------------------

@@ -11,8 +11,9 @@ backpack, handbag, ...). That single model covers every category VIGLANCE
 reasons about, so the former second detector
 (``Subh775/Threat-Detection-YOLOv8n``) is disabled: it is never resolved,
 never downloaded, and its cross-model "agreement" rule is gone. Weapon
-alerts therefore need ONE model's high-confidence detection persisting
-across frames.
+    High-confidence bar (``high_conf``) applies to streak counting for every
+    category, so weapon AND fire/smoke alerts all need sustained high-confidence
+    detections. Bag alerts stay dark unless explicitly enabled.
 
 ``MultiModelThreatDetector`` is a backwards-compatible alias for
 ``SurveillanceThreatDetector`` (the two-model era). ``threat_weights`` is
@@ -80,12 +81,14 @@ class SurveillanceThreatDetector:
         threat_weights: Optional[str] = None,
         download_missing: bool = True,
         conf: float = 0.35,
-        high_conf: float = 0.70,
+        high_conf: float = 0.85,
         confirm_frames: int = 3,
         imgsz: int = 640,
         device: str = "auto",
         bag_proximity_px: float = 150.0,
         enable_weapon_alerts: bool = False,
+        enable_fire_alerts: bool = True,
+        enable_bag_alerts: bool = False,
     ):
         if threat_weights:
             log.warning(
@@ -102,6 +105,8 @@ class SurveillanceThreatDetector:
         self.device = device
         self.bag_proximity_px = float(bag_proximity_px)
         self.enable_weapon_alerts = bool(enable_weapon_alerts)
+        self.enable_fire_alerts = bool(enable_fire_alerts)
+        self.enable_bag_alerts = bool(enable_bag_alerts)
         self.models: Dict[str, Any] = {}
         self.status: Dict[str, Dict[str, Any]] = {}
         self.streaks: Dict[str, int] = {}
@@ -272,14 +277,16 @@ class SurveillanceThreatDetector:
             }
         for category, title in (("fire", "Fire Threat"), ("smoke", "Smoke Threat")):
             detection = best[category]
-            if detection is not None and self.streaks[category] >= self.confirm_frames:
+            if (self.enable_fire_alerts and detection is not None
+                    and self.streaks[category] >= self.confirm_frames):
                 alerts[title] = {
                     "alert": True, "category": category,
                     "confidence": round(float(detection.confidence), 3),
                     "message": f"{category.title()} candidate persisted across frames.",
                 }
         bag = best["bag"]
-        if (bag is not None and self._bag_is_separated(bag, persons or [])
+        if (self.enable_bag_alerts and bag is not None
+                and self._bag_is_separated(bag, persons or [])
                 and self.streaks["bag"] >= self.confirm_frames):
             alerts["Unattended Bag Candidate"] = {
                 "alert": True, "category": "bag",
